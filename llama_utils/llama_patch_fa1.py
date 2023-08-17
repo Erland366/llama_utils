@@ -1,5 +1,4 @@
 from typing import List, Optional, Tuple
-from importlib.metadata import version
 
 import torch
 from torch import nn
@@ -8,14 +7,8 @@ import transformers
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from peft.tuners.lora import LoraLayer
 
-FLASH_ATTN_VER = version("flash_attn")
-FLASH_ATTN_2 = True if FLASH_ATTN_VER.startswith("2.") else False
-
 try:
-    if FLASH_ATTN_2:
-        from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
-    else:
-        from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
     from flash_attn.bert_padding import unpad_input, pad_input
 except Exception:
     raise ModuleNotFoundError(
@@ -25,12 +18,14 @@ except Exception:
 try:
     from einops import rearrange
 except Exception:
-    raise ModuleNotFoundError("Please install einops first, e.g., with pip install einops")
+    raise ModuleNotFoundError(
+        "Please install einops first, e.g., with pip install einops"
+    )
 
 
-
-#I adapted from philschmid
+# I adapted from philschmid
 # https://github.com/philschmid/deep-learning-pytorch-huggingface/blob/main/training/utils/llama_patch.py
+
 
 # ADAPTED from https://github.com/allenai/open-instruct/blob/main/open_instruct/llama_flash_attn_monkey_patch.py
 # AND https://github.com/lm-sys/FastChat/blob/main/fastchat/train/llama_flash_attn_monkey_patch.py
@@ -50,35 +45,48 @@ def forward(
     attention_mask: [bsz, q_len]
     """
     if output_attentions:
-        warnings.warn("Output attentions is not supported for patched `LlamaAttention`, returning `None` instead.")
+        warnings.warn(
+            "Output attentions is not supported for patched `LlamaAttention`, returning `None` instead."
+        )
 
     bsz, q_len, _ = hidden_states.size()
 
-    query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    query_states = (
+        self.q_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
+    )
+    key_states = (
+        self.k_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
+    )
+    value_states = (
+        self.v_proj(hidden_states)
+        .view(bsz, q_len, self.num_heads, self.head_dim)
+        .transpose(1, 2)
+    )
     # [bsz, q_len, nh, hd]
     # [bsz, nh, q_len, hd]
 
     kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
+    assert past_key_value is None, "past_key_value is not supported"
+
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states, cos, sin, position_ids
+    )
 
-    # Past Key value support
-    if past_key_value is not None:
-        # reuse k, v, self_attention
-        key_states = torch.cat([past_key_value[0], key_states], dim=2)
-        value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-    past_key_value = (key_states, value_states) if use_cache else None
+    assert not output_attentions, "output_attentions is not supported"
+    assert not use_cache, "use_cache is not supported"
 
     # Flash attention codes from
     # https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
 
     # transform the data into the format required by flash attention
-    qkv = torch.stack([query_states, key_states, value_states], dim=2)  # [bsz, nh, 3, q_len, hd]
+    qkv = torch.stack(
+        [query_states, key_states, value_states], dim=2
+    )  # [bsz, nh, 3, q_len, hd]
     qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
     # We have disabled _prepare_decoder_attention_mask in LlamaModel
     # the attention_mask should be the same as the key_padding_mask
@@ -87,27 +95,27 @@ def forward(
     if key_padding_mask is None:
         qkv = rearrange(qkv, "b s ... -> (b s) ...")
         max_s = q_len
-        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device)
-        if FLASH_ATTN_2:
-            output = flash_attn_varlen_qkvpacked_func(qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True)
-        else:
-            output = flash_attn_unpadded_qkvpacked_func(qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True)
+        cu_q_lens = torch.arange(
+            0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device
+        )
+        output = flash_attn_unpadded_qkvpacked_func(
+            qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+        )
         output = rearrange(output, "(b s) ... -> b s ...", b=bsz)
     else:
         nheads = qkv.shape[-2]
         x = rearrange(qkv, "b s three h d -> b s (three h d)")
         x_unpad, indices, cu_q_lens, max_s = unpad_input(x, key_padding_mask)
-        x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
-        if FLASH_ATTN_2:
-            output_unpad = flash_attn_varlen_qkvpacked_func(
-                x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
-            )
-        else:
-            output_unpad = flash_attn_unpadded_qkvpacked_func(
-                x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
-            )
+        x_unpad = rearrange(
+            x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads
+        )
+        output_unpad = flash_attn_unpadded_qkvpacked_func(
+            x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+        )
         output = rearrange(
-            pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len),
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len
+            ),
             "b s (h d) -> b s h d",
             h=nheads,
         )
@@ -116,7 +124,9 @@ def forward(
 
 # Disable the transformation of the attention mask in LlamaModel as the flash attention
 # requires the attention mask to be the same as the key_padding_mask
-def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+def _prepare_decoder_attention_mask(
+    self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
     # [bsz, seq_len]
     return attention_mask
 
